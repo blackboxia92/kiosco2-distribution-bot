@@ -8,6 +8,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import sqlite3
@@ -59,6 +60,17 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(raw))
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def parse_healthcheck_urls(raw: str) -> tuple[str, ...]:
+    """Accept comma- or whitespace-separated URLs from deployment variables."""
+    urls = tuple(value for value in re.split(r"[,\s]+", raw.strip()) if value)
+    if not urls:
+        return DEFAULT_HEALTHCHECK_URLS
+    invalid = [url for url in urls if not url.startswith(("https://", "http://"))]
+    if invalid:
+        raise ValueError("HEALTHCHECK_URLS must contain absolute HTTP(S) URLs")
+    return urls
 
 
 @dataclass(frozen=True)
@@ -129,10 +141,8 @@ class Settings:
             ph_poll_seconds=env_int("PH_POLL_SECONDS", 300, 30),
             port=env_int("PORT", 8080),
             affiliate_tag=os.getenv("AMAZON_ASSOCIATE_TAG", "blackboxia92-21").strip(),
-            healthcheck_urls=tuple(
-                url.strip()
-                for url in os.getenv("HEALTHCHECK_URLS", ",".join(DEFAULT_HEALTHCHECK_URLS)).split(",")
-                if url.strip()
+            healthcheck_urls=parse_healthcheck_urls(
+                os.getenv("HEALTHCHECK_URLS", ",".join(DEFAULT_HEALTHCHECK_URLS))
             ),
             daily_report_hour=env_int("DAILY_REPORT_HOUR", 20, 0),
         )

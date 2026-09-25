@@ -16,6 +16,8 @@ from auto_distributor import (
     Settings,
     TelegramClient,
     create_app,
+    parse_healthcheck_urls,
+    probe_services,
 )
 from metrics import MetricsStore
 from source_item import SourceItem
@@ -24,6 +26,15 @@ from source_item import SourceItem
 class FailingSession:
     def post(self, *args, **kwargs):
         raise requests.HTTPError("simulated provider failure")
+
+
+class HealthSession:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return Mock(status_code=200)
 
 
 def settings(database: Path, **overrides) -> Settings:
@@ -141,6 +152,23 @@ class UnifiedRuntimeTests(unittest.TestCase):
                 "version": "2.0.0",
             },
         )
+
+    def test_healthcheck_urls_accept_spaces_and_get_follows_redirects(self) -> None:
+        urls = parse_healthcheck_urls(
+            "https://kiosco2-distribution-bot-production.up.railway.app/health "
+            "https://stacksignal-tech.netlify.app/"
+        )
+        self.assertEqual(len(urls), 2)
+        self.assertEqual(
+            urls[0],
+            "https://kiosco2-distribution-bot-production.up.railway.app/health",
+        )
+
+        session = HealthSession()
+        results = probe_services(urls, session)
+        self.assertEqual([result.status_code for result in results], [200, 200])
+        self.assertTrue(all(call[1]["allow_redirects"] for call in session.calls))
+        self.assertTrue(all(call[1]["timeout"] == 12 for call in session.calls))
 
     def test_stats_command_only_runs_for_authorized_chat(self) -> None:
         configured = settings(self.database)
