@@ -532,73 +532,103 @@ def _format_amount(value: float) -> str:
     return _escape_markdown(f"{value:,.2f}")
 
 
+def _is_internal_test_project(item: ProjectDailyStats) -> bool:
+    identity = f"{item.project_id} {item.name}".lower()
+    return (
+        item.project_id in HIDDEN_REPORT_PROJECT_IDS
+        or "smoke" in identity
+        or ("deployment" in identity and "test" in identity)
+    )
+
+
 def format_daily_report(
     report_date: date,
     stats: list[ProjectDailyStats],
     health: list[ServiceHealth] | None = None,
     affiliate_tag: str = "blackboxia92-21",
 ) -> str:
-    """Create an ecosystem report: four kiosks first, then the two addons."""
+    """Create a concise executive report instead of exposing internal counters."""
+    visible_stats = [item for item in stats if not _is_internal_test_project(item)]
+    by_id = {item.project_id: item for item in visible_stats}
+
     lines = [
-        f"📊 *Reporte diario · {_escape_markdown(report_date.strftime('%d/%m/%Y'))}*",
+        f"📊 *Resumen de hoy · {_escape_markdown(report_date.strftime('%d/%m/%Y'))}*",
         "_Zona horaria: ART_",
-        "_Ecosistema: 4 kioscos \\+ 2 addons_",
         "",
+        "*ESTADO GENERAL*",
     ]
 
-    visible_stats = [item for item in stats if item.project_id not in HIDDEN_REPORT_PROJECT_IDS]
-    for kind, heading in (
-        ("kiosk", "KIOSCOS"),
-        ("addon", "ADDONS"),
-        ("external", "OTROS PROYECTOS"),
-    ):
-        items = [item for item in visible_stats if item.kind == kind]
-        if not items:
-            continue
-        lines.append(f"*{heading}*")
-        for item in items:
-            prefix = "↳ " if item.parent_id else ""
-            lines.append(f"{prefix}*{_escape_markdown(item.name)}*")
-            if item.project_id == "telegram-analytics-ops":
-                lines.append("  Panel y consolidación: _operativo_")
-            elif not item.telemetry_connected:
-                lines.append("  Telemetría de negocio: _pendiente de integrar_")
-            else:
-                lines.append(
-                    f"  Ingresos {_format_amount(item.revenue)} · "
-                    f"Costos {_format_amount(item.cost)} · "
-                    f"Clics {_escape_markdown(item.clicks)}"
-                )
-            if item.project_id == "kiosco2-distribution-bot":
-                lines.append(
-                    "  Oportunidades: "
-                    f"{_escape_markdown(item.opportunities_notified)} notificadas · "
-                    f"{_escape_markdown(item.opportunities_approved)} aprobadas · "
-                    f"{_escape_markdown(item.opportunities_discarded)} omitidas"
-                )
-            lines.append("")
-
-    total_revenue = sum(item.revenue for item in stats)
-    total_cost = sum(item.cost for item in stats)
-    amazon_revenue = sum(item.amazon_revenue for item in stats)
-    total_clicks = sum(item.clicks for item in stats)
-    lines.extend(
-        [
-            "*TOTAL REGISTRADO \\(FUENTES CONECTADAS\\)*",
-            f"Ingresos registrados: *{_format_amount(total_revenue)}*",
-            f"Amazon {_escape_markdown(affiliate_tag)}: *{_format_amount(amazon_revenue)}*",
-            f"Clics afiliados: *{_escape_markdown(total_clicks)}*",
-            f"Costos registrados: *{_format_amount(total_cost)}*",
-            f"Neto registrado: *{_format_amount(total_revenue - total_cost)}*",
-        ]
-    )
-    if not visible_stats:
-        lines.insert(3, "Sin actividad financiera o de clics registrada durante el día\\.")
     if health:
-        lines.extend(["", "*SALUD DE SERVICIOS*"])
-        for service in health:
-            icon = "✅" if service.healthy else "❌"
-            lines.append(
-                f"{icon} {_escape_markdown(service.name)}: HTTP {_escape_markdown(service.status_code)} · {_escape_markdown(service.latency_ms)} ms"
+        healthy_count = sum(service.healthy for service in health)
+        icon = "✅" if healthy_count == len(health) else "⚠️"
+        lines.append(
+            f"{icon} *{_escape_markdown(healthy_count)} de "
+            f"{_escape_markdown(len(health))} servicios en línea*"
+        )
+        for service in (item for item in health if not item.healthy):
+            status = (
+                "sin respuesta"
+                if service.status_code == 0
+                else f"HTTP {service.status_code}"
             )
+            lines.append(
+                f"❌ {_escape_markdown(service.name)}: {_escape_markdown(status)}"
+            )
+    else:
+        lines.append("⚪ Estado técnico no disponible")
+
+    pending_kiosks = [
+        item
+        for item in visible_stats
+        if item.kind == "kiosk" and not item.telemetry_connected
+    ]
+    stack_signal = by_id.get("stacksignal-tech")
+    lines.extend(["", "*ACTIVIDAD DEL DÍA*"])
+    if pending_kiosks:
+        lines.append("⚠️ Todavía faltan métricas de Kioscos 1, 2 y 3")
+    if stack_signal:
+        lines.append(
+            f"• Kiosco 4: *{_escape_markdown(stack_signal.clicks)} clics afiliados*"
+        )
+
+    distribution = by_id.get("kiosco2-distribution-bot")
+    lines.extend(["", "*DISTRIBUCIÓN DE KIOSCO 2*"])
+    if distribution:
+        notified = distribution.opportunities_notified
+        approved = distribution.opportunities_approved
+        discarded = distribution.opportunities_discarded
+        approval_rate = round((approved / notified) * 100) if notified else 0
+        lines.extend(
+            [
+                f"• *{_escape_markdown(notified)}* propuestas enviadas al panel",
+                (
+                    f"• *{_escape_markdown(approved)}* aprobadas · "
+                    f"*{_escape_markdown(discarded)}* omitidas"
+                ),
+                f"• Tasa de aprobación: *{_escape_markdown(approval_rate)}%*",
+            ]
+        )
+    else:
+        lines.append("⚪ Sin datos del distribuidor")
+
+    total_revenue = sum(item.revenue for item in visible_stats)
+    total_cost = sum(item.cost for item in visible_stats)
+    amazon_revenue = sum(item.amazon_revenue for item in visible_stats)
+    lines.extend(["", "*DINERO REGISTRADO*"])
+    if total_revenue == 0 and total_cost == 0:
+        lines.append("• Aún no hay ingresos ni costos registrados")
+    else:
+        lines.extend(
+            [
+                f"• Ingresos: *{_format_amount(total_revenue)}*",
+                f"• Costos: *{_format_amount(total_cost)}*",
+                f"• Neto: *{_format_amount(total_revenue - total_cost)}*",
+            ]
+        )
+    if amazon_revenue:
+        lines.append(
+            f"• Amazon {_escape_markdown(affiliate_tag)}: "
+            f"*{_format_amount(amazon_revenue)}*"
+        )
+    lines.append("_Solo incluye fuentes conectadas; no es la facturación total_")
     return "\n".join(lines)

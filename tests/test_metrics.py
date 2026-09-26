@@ -10,6 +10,7 @@ from pathlib import Path
 from metrics import (
     FinancialEventCreate,
     MetricsStore,
+    ServiceHealth,
     TrafficEventCreate,
     format_daily_report,
 )
@@ -97,6 +98,13 @@ class MetricsStoreTests(unittest.TestCase):
                 timestamp=event_time,
             )
         )
+        self.store.log_operational_event(
+            project_id="railway-smoke",
+            project_name="Deployment Smoke Test",
+            action="probe",
+            details="{}",
+            timestamp=event_time,
+        )
 
         stats = self.store.daily_stats(date(2026, 9, 25))
         by_id = {item.project_id: item for item in stats}
@@ -120,18 +128,32 @@ class MetricsStoreTests(unittest.TestCase):
         self.assertEqual(by_id["beta"].operational_events, 1)
 
         report = format_daily_report(date(2026, 9, 25), stats)
-        self.assertIn("Alpha SaaS", report)
+        self.assertNotIn("Alpha SaaS", report)
         self.assertNotIn("Deployment Smoke Test", report)
         self.assertNotIn("deployment-smoke-test", report)
-        self.assertIn("Ingresos registrados: *145\\.00*", report)
-        self.assertIn("Costos registrados: *35\\.50*", report)
-        self.assertIn("Neto registrado: *109\\.50*", report)
-        self.assertIn("Clics afiliados: *1*", report)
-        self.assertIn("KIOSCOS", report)
-        self.assertIn("ADDONS", report)
-        self.assertIn("Kiosco 1", report)
-        self.assertIn("Distribuidor de Kiosco 2", report)
+        self.assertNotIn("railway-smoke", report)
+        self.assertIn("Ingresos: *140\\.00*", report)
+        self.assertIn("Costos: *35\\.50*", report)
+        self.assertIn("Neto: *104\\.50*", report)
+        self.assertIn("ESTADO GENERAL", report)
+        self.assertIn("ACTIVIDAD DEL DÍA", report)
+        self.assertIn("DISTRIBUCIÓN DE KIOSCO 2", report)
+        self.assertIn("Kioscos 1, 2 y 3", report)
         self.assertNotIn("Eventos operativos", report)
+
+    def test_healthy_services_are_summarized_without_technical_noise(self) -> None:
+        stats = self.store.daily_stats(date(2026, 9, 25))
+        health = [
+            ServiceHealth("Kiosco 1", "https://one.example/health", 200, 70),
+            ServiceHealth("Kiosco 2", "https://two.example/health", 200, 90),
+        ]
+
+        report = format_daily_report(date(2026, 9, 25), stats, health)
+
+        self.assertIn("2 de 2 servicios en línea", report)
+        self.assertNotIn("https://", report)
+        self.assertNotIn("HTTP 200", report)
+        self.assertNotIn("70 ms", report)
 
     def test_monitor_scans_are_not_presented_as_business_activity(self) -> None:
         event_time = datetime(2026, 9, 25, 15, 0, tzinfo=timezone.utc)
