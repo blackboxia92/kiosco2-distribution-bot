@@ -4,19 +4,74 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 ART_TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 PROJECT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 HIDDEN_REPORT_PROJECT_IDS = frozenset({"deployment-smoke-test"})
+
+
+@dataclass(frozen=True)
+class ProjectDefinition:
+    """Canonical portfolio entry used even when a service emitted no events."""
+
+    project_id: str
+    name: str
+    kind: Literal["kiosk", "addon"]
+    display_order: int
+    parent_id: str = ""
+    telemetry_connected: bool = False
+
+
+PORTFOLIO_PROJECTS = (
+    ProjectDefinition(
+        "kiosco1-b2b-lead-extractor",
+        "Kiosco 1 · B2B Lead Extractor",
+        "kiosk",
+        10,
+    ),
+    ProjectDefinition(
+        "kiosco2-directory-submitter",
+        "Kiosco 2 · LaunchScale",
+        "kiosk",
+        20,
+    ),
+    ProjectDefinition(
+        "kiosco3-b2b-alert-monitor",
+        "Kiosco 3 · B2B Alert Monitor",
+        "kiosk",
+        30,
+    ),
+    ProjectDefinition(
+        "stacksignal-tech",
+        "Kiosco 4 · StackSignal",
+        "kiosk",
+        40,
+        telemetry_connected=True,
+    ),
+    ProjectDefinition(
+        "kiosco2-distribution-bot",
+        "Distribuidor de Kiosco 2",
+        "addon",
+        50,
+        parent_id="kiosco2-directory-submitter",
+        telemetry_connected=True,
+    ),
+    ProjectDefinition(
+        "telegram-analytics-ops",
+        "Telegram Analytics & Operations",
+        "addon",
+        60,
+    ),
+)
 
 
 def utc_now() -> datetime:
@@ -104,6 +159,15 @@ class ProjectDailyStats:
     amazon_revenue: float
     clicks: int
     operational_events: int
+    kind: str = "kiosk"
+    parent_id: str = ""
+    display_order: int = 999
+    telemetry_connected: bool = False
+    meaningful_events: int = 0
+    monitor_scans: int = 0
+    opportunities_notified: int = 0
+    opportunities_approved: int = 0
+    opportunities_discarded: int = 0
 
     @property
     def net(self) -> float:
@@ -143,7 +207,11 @@ class MetricsStore:
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     created_at TIMESTAMP NOT NULL,
-                    active BOOLEAN NOT NULL DEFAULT 1
+                    active BOOLEAN NOT NULL DEFAULT 1,
+                    kind TEXT NOT NULL DEFAULT 'external',
+                    parent_id TEXT NOT NULL DEFAULT '',
+                    display_order INTEGER NOT NULL DEFAULT 999,
+                    telemetry_connected BOOLEAN NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS financial_events (
@@ -193,6 +261,46 @@ class MetricsStore:
                     "ALTER TABLE financial_events ADD COLUMN affiliate_tag TEXT NOT NULL DEFAULT ''"
                 )
 
+            project_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(projects)")
+            }
+            project_migrations = {
+                "kind": "TEXT NOT NULL DEFAULT 'external'",
+                "parent_id": "TEXT NOT NULL DEFAULT ''",
+                "display_order": "INTEGER NOT NULL DEFAULT 999",
+                "telemetry_connected": "BOOLEAN NOT NULL DEFAULT 0",
+            }
+            for name, definition in project_migrations.items():
+                if name not in project_columns:
+                    db.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
+
+            created_at = utc_now().isoformat()
+            for project in PORTFOLIO_PROJECTS:
+                db.execute(
+                    """
+                    INSERT INTO projects (
+                        id, name, created_at, active, kind, parent_id,
+                        display_order, telemetry_connected
+                    ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        active = 1,
+                        kind = excluded.kind,
+                        parent_id = excluded.parent_id,
+                        display_order = excluded.display_order,
+                        telemetry_connected = excluded.telemetry_connected
+                    """,
+                    (
+                        project.project_id,
+                        project.name,
+                        created_at,
+                        project.kind,
+                        project.parent_id,
+                        project.display_order,
+                        int(project.telemetry_connected),
+                    ),
+                )
+
     def log_financial_event(
         self, event: FinancialEventCreate
     ) -> FinancialEventResponse:
@@ -206,7 +314,10 @@ class MetricsStore:
                 INSERT INTO projects (id, name, created_at, active)
                 VALUES (?, ?, ?, 1)
                 ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
+                    name = CASE
+                        WHEN projects.kind IN ('kiosk', 'addon') THEN projects.name
+                        ELSE excluded.name
+                    END,
                     active = 1
                 """,
                 (event.project_id, event.project_name, created_at),
@@ -246,7 +357,12 @@ class MetricsStore:
                 """
                 INSERT INTO projects (id, name, created_at, active)
                 VALUES (?, ?, ?, 1)
-                ON CONFLICT(id) DO UPDATE SET name = excluded.name, active = 1
+                ON CONFLICT(id) DO UPDATE SET
+                    name = CASE
+                        WHEN projects.kind IN ('kiosk', 'addon') THEN projects.name
+                        ELSE excluded.name
+                    END,
+                    active = 1
                 """,
                 (event.project_id, event.project_name, utc_now().isoformat()),
             )
@@ -284,7 +400,10 @@ class MetricsStore:
                 INSERT INTO projects (id, name, created_at, active)
                 VALUES (?, ?, ?, 1)
                 ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
+                    name = CASE
+                        WHEN projects.kind IN ('kiosk', 'addon') THEN projects.name
+                        ELSE excluded.name
+                    END,
                     active = 1
                 """,
                 (project_id, project_name, utc_now().isoformat()),
@@ -312,17 +431,7 @@ class MetricsStore:
         with self._db() as db:
             rows = db.execute(
                 """
-                WITH active_projects AS (
-                    SELECT project_id FROM financial_events
-                    WHERE timestamp >= ? AND timestamp < ?
-                    UNION
-                    SELECT project_id FROM operational_events
-                    WHERE timestamp >= ? AND timestamp < ?
-                    UNION
-                    SELECT project_id FROM traffic_events
-                    WHERE timestamp >= ? AND timestamp < ?
-                ),
-                financial AS (
+                WITH financial AS (
                     SELECT
                         project_id,
                         SUM(CASE WHEN event_type = 'REVENUE' THEN amount ELSE 0 END)
@@ -335,7 +444,19 @@ class MetricsStore:
                     GROUP BY project_id
                 ),
                 operational AS (
-                    SELECT project_id, COUNT(*) AS event_count
+                    SELECT
+                        project_id,
+                        COUNT(*) AS event_count,
+                        SUM(CASE WHEN action != 'monitor_scan' THEN 1 ELSE 0 END)
+                            AS meaningful_events,
+                        SUM(CASE WHEN action = 'monitor_scan' THEN 1 ELSE 0 END)
+                            AS monitor_scans,
+                        SUM(CASE WHEN action = 'opportunity_notified' THEN 1 ELSE 0 END)
+                            AS opportunities_notified,
+                        SUM(CASE WHEN action = 'opportunity_approved' THEN 1 ELSE 0 END)
+                            AS opportunities_approved,
+                        SUM(CASE WHEN action = 'opportunity_discarded' THEN 1 ELSE 0 END)
+                            AS opportunities_discarded
                     FROM operational_events
                     WHERE timestamp >= ? AND timestamp < ?
                     GROUP BY project_id
@@ -349,25 +470,28 @@ class MetricsStore:
                 SELECT
                     p.id AS project_id,
                     p.name,
+                    p.kind,
+                    p.parent_id,
+                    p.display_order,
+                    p.telemetry_connected,
                     COALESCE(f.revenue, 0) AS revenue,
                     COALESCE(f.cost, 0) AS cost,
                     COALESCE(f.amazon_revenue, 0) AS amazon_revenue,
                     COALESCE(t.click_count, 0) AS clicks,
-                    COALESCE(o.event_count, 0) AS operational_events
-                FROM active_projects a
-                JOIN projects p ON p.id = a.project_id
+                    COALESCE(o.event_count, 0) AS operational_events,
+                    COALESCE(o.meaningful_events, 0) AS meaningful_events,
+                    COALESCE(o.monitor_scans, 0) AS monitor_scans,
+                    COALESCE(o.opportunities_notified, 0) AS opportunities_notified,
+                    COALESCE(o.opportunities_approved, 0) AS opportunities_approved,
+                    COALESCE(o.opportunities_discarded, 0) AS opportunities_discarded
+                FROM projects p
                 LEFT JOIN financial f ON f.project_id = p.id
                 LEFT JOIN operational o ON o.project_id = p.id
                 LEFT JOIN traffic t ON t.project_id = p.id
-                ORDER BY p.name COLLATE NOCASE, p.id
+                WHERE p.active = 1
+                ORDER BY p.display_order, p.name COLLATE NOCASE, p.id
                 """,
                 (
-                    start_utc,
-                    end_utc,
-                    start_utc,
-                    end_utc,
-                    start_utc,
-                    end_utc,
                     start_utc,
                     end_utc,
                     start_utc,
@@ -386,6 +510,15 @@ class MetricsStore:
                 amazon_revenue=float(row["amazon_revenue"]),
                 clicks=int(row["clicks"]),
                 operational_events=int(row["operational_events"]),
+                kind=str(row["kind"]),
+                parent_id=str(row["parent_id"]),
+                display_order=int(row["display_order"]),
+                telemetry_connected=bool(row["telemetry_connected"]),
+                meaningful_events=int(row["meaningful_events"]),
+                monitor_scans=int(row["monitor_scans"]),
+                opportunities_notified=int(row["opportunities_notified"]),
+                opportunities_approved=int(row["opportunities_approved"]),
+                opportunities_discarded=int(row["opportunities_discarded"]),
             )
             for row in rows
         ]
@@ -405,26 +538,45 @@ def format_daily_report(
     health: list[ServiceHealth] | None = None,
     affiliate_tag: str = "blackboxia92-21",
 ) -> str:
-    """Create a Telegram MarkdownV2 report from a fully dynamic project list."""
+    """Create an ecosystem report: four kiosks first, then the two addons."""
     lines = [
         f"📊 *Reporte diario · {_escape_markdown(report_date.strftime('%d/%m/%Y'))}*",
         "_Zona horaria: ART_",
+        "_Ecosistema: 4 kioscos \\+ 2 addons_",
         "",
     ]
 
     visible_stats = [item for item in stats if item.project_id not in HIDDEN_REPORT_PROJECT_IDS]
-    for item in visible_stats:
-        lines.extend(
-            [
-                f"*{_escape_markdown(item.name)}* · {_escape_markdown(item.project_id)}",
-                f"  Ingresos: *{_format_amount(item.revenue)}*",
-                f"  Costos: *{_format_amount(item.cost)}*",
-                f"  Ganancia neta: *{_format_amount(item.net)}*",
-                f"  Clics: *{_escape_markdown(item.clicks)}*",
-                f"  Eventos operativos: {_escape_markdown(item.operational_events)}",
-                "",
-            ]
-        )
+    for kind, heading in (
+        ("kiosk", "KIOSCOS"),
+        ("addon", "ADDONS"),
+        ("external", "OTROS PROYECTOS"),
+    ):
+        items = [item for item in visible_stats if item.kind == kind]
+        if not items:
+            continue
+        lines.append(f"*{heading}*")
+        for item in items:
+            prefix = "↳ " if item.parent_id else ""
+            lines.append(f"{prefix}*{_escape_markdown(item.name)}*")
+            if item.project_id == "telegram-analytics-ops":
+                lines.append("  Panel y consolidación: _operativo_")
+            elif not item.telemetry_connected:
+                lines.append("  Telemetría de negocio: _pendiente de integrar_")
+            else:
+                lines.append(
+                    f"  Ingresos {_format_amount(item.revenue)} · "
+                    f"Costos {_format_amount(item.cost)} · "
+                    f"Clics {_escape_markdown(item.clicks)}"
+                )
+            if item.project_id == "kiosco2-distribution-bot":
+                lines.append(
+                    "  Oportunidades: "
+                    f"{_escape_markdown(item.opportunities_notified)} notificadas · "
+                    f"{_escape_markdown(item.opportunities_approved)} aprobadas · "
+                    f"{_escape_markdown(item.opportunities_discarded)} omitidas"
+                )
+            lines.append("")
 
     total_revenue = sum(item.revenue for item in stats)
     total_cost = sum(item.cost for item in stats)
@@ -432,18 +584,18 @@ def format_daily_report(
     total_clicks = sum(item.clicks for item in stats)
     lines.extend(
         [
-            "*TOTAL CONSOLIDADO*",
-            f"Ingresos Totales: *{_format_amount(total_revenue)}*",
+            "*TOTAL REGISTRADO \\(FUENTES CONECTADAS\\)*",
+            f"Ingresos registrados: *{_format_amount(total_revenue)}*",
             f"Amazon {_escape_markdown(affiliate_tag)}: *{_format_amount(amazon_revenue)}*",
             f"Clics afiliados: *{_escape_markdown(total_clicks)}*",
-            f"Costos Totales: *{_format_amount(total_cost)}*",
-            f"Ganancia Neta: *{_format_amount(total_revenue - total_cost)}*",
+            f"Costos registrados: *{_format_amount(total_cost)}*",
+            f"Neto registrado: *{_format_amount(total_revenue - total_cost)}*",
         ]
     )
-    if not stats:
+    if not visible_stats:
         lines.insert(3, "Sin actividad financiera o de clics registrada durante el día\\.")
     if health:
-        lines.extend(["", "*ESTADO DE SERVICIOS*"])
+        lines.extend(["", "*SALUD DE SERVICIOS*"])
         for service in health:
             icon = "✅" if service.healthy else "❌"
             lines.append(

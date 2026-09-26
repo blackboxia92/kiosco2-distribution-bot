@@ -10,7 +10,6 @@ import requests
 
 from source_item import SourceItem
 
-
 ALGOLIA_ENDPOINT = "https://hn.algolia.com/api/v1/search_by_date"
 KEYWORDS = (
     "launching",

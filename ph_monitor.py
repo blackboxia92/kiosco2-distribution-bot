@@ -10,7 +10,6 @@ import requests
 
 from source_item import SourceItem
 
-
 PRODUCT_HUNT_FEED = "https://www.producthunt.com/feed"
 
 

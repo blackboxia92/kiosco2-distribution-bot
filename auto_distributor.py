@@ -14,11 +14,12 @@ import signal
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import requests
 import uvicorn
@@ -39,15 +40,23 @@ from metrics import (
 from ph_monitor import ProductHuntMonitor
 from source_item import SourceItem
 
-
 LOGGER = logging.getLogger("kiosco2")
 BOT_PROJECT_ID = "kiosco2-distribution-bot"
 BOT_PROJECT_NAME = "Kiosco 2 Distribution Bot"
 DEFAULT_HEALTHCHECK_URLS = (
+    "https://blackboxia92.app.n8n.cloud/healthz",
+    "https://kiosco2-directory-submitter-production.up.railway.app/health",
     "https://kiosco2-distribution-bot-production.up.railway.app/health",
     "https://kiosco3-b2b-alert-monitor.blackboxia92.workers.dev/health",
     "https://stacksignal-tech.netlify.app/",
 )
+HEALTHCHECK_NAMES = {
+    "blackboxia92.app.n8n.cloud": "Kiosco 1 · n8n",
+    "kiosco2-directory-submitter-production.up.railway.app": "Kiosco 2 · LaunchScale",
+    "kiosco2-distribution-bot-production.up.railway.app": "↳ Distribuidor de Kiosco 2",
+    "kiosco3-b2b-alert-monitor.blackboxia92.workers.dev": "Kiosco 3 · Alert Monitor",
+    "stacksignal-tech.netlify.app": "Kiosco 4 · StackSignal",
+}
 
 
 def utc_now_text() -> str:
@@ -94,7 +103,7 @@ class Settings:
     daily_report_hour: int = 20
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         requested = os.getenv("LLM_PROVIDER", "auto").strip().lower()
         groq_key = os.getenv("GROQ_API_KEY", "").strip()
         openai_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -231,7 +240,7 @@ class OpportunityStore:
 
     @staticmethod
     def lead_id(item: SourceItem) -> str:
-        value = f"{item.source}:{item.item_id}".encode("utf-8")
+        value = f"{item.source}:{item.item_id}".encode()
         return hashlib.sha256(value).hexdigest()[:24]
 
     def source_initialized(self, source: str) -> bool:
@@ -821,7 +830,8 @@ def probe_services(
             status_code = 0
         latency_ms = int((time.monotonic() - started) * 1000)
         host = url.split("//", 1)[-1].split("/", 1)[0]
-        results.append(ServiceHealth(host, url, status_code, latency_ms))
+        name = HEALTHCHECK_NAMES.get(host, host)
+        results.append(ServiceHealth(name, url, status_code, latency_ms))
     return results
 
 
